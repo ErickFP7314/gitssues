@@ -9,46 +9,85 @@ class GitLabUploader:
         self.url = os.getenv("GITLAB_URL")
         self.token = os.getenv("GITLAB_TOKEN")
         self.project_id = os.getenv("PROJECT_ID")
-        
         if not all([self.url, self.token, self.project_id]):
             raise ValueError("Faltan variables de entorno en config.env (GITLAB_URL, GITLAB_TOKEN, PROJECT_ID)")
 
         self.gl = gitlab.Gitlab(self.url, private_token=self.token)
-        self.project = self.gl.projects.get(self.project_id)
+        self.project = None
+
+    def set_project(self, project_id_or_instance):
+        """Sets the active project using an ID or a project instance."""
+        if isinstance(project_id_or_instance, (int, str)):
+            self.project = self.gl.projects.get(project_id_or_instance)
+        else:
+            self.project = project_id_or_instance
+
+    def get_group(self, group_id):
+        """Fetches a group by ID or path."""
+        try:
+            return self.gl.groups.get(group_id)
+        except:
+            return None
+
+    def get_project(self, project_id):
+        """Fetches a project by ID or path."""
+        try:
+            return self.gl.projects.get(project_id)
+        except:
+            return None
+
+    def get_group_contents(self, group):
+        """Retrieves subgroups and projects for a given group instance."""
+        subgroups = group.subgroups.list(all=True)
+        # We need to fetch the full group objects for subgroups to get more details if needed, 
+        # but for navigation names and IDs are usually enough.
+        projects = group.projects.list(all=True)
+        return subgroups, projects
 
     def get_milestones(self):
-        """Fetches active milestones from the project."""
-        return self.project.milestones.list(state='active')
+        """Fetches active milestones from the project and its parent groups."""
+        return self.project.milestones.list(state='active', include_parent_milestones=True)
 
     def get_members(self):
         """Fetches project members."""
         # all=True ensures we get members even if inherited from groups
         return self.project.members.list(all=True)
 
-    def ensure_labels(self, labels_string, color="#FF0000"):
-        """Ensures that the global labels exist in the project with the specified color."""
-        if not labels_string:
+    def get_labels(self):
+        """Fetches all labels from the project."""
+        return self.project.labels.list(all=True)
+
+    def ensure_labels(self, labels_list, color=None):
+        """Ensures that the labels in the list exist in the project."""
+        if not labels_list:
             return []
         
-        names = [n.strip() for n in labels_string.split(",") if n.strip()]
+        if isinstance(labels_list, str):
+            names = [n.strip() for n in labels_list.split(",") if n.strip()]
+        else:
+            names = labels_list
+            
+        final_names = []
         for name in names:
             try:
                 # Check if label exists and update color if needed
                 lbl = self.project.labels.get(name)
-                if lbl.color.upper() != color.upper():
+                if color and lbl.color.upper() != color.upper():
                     lbl.color = color
                     lbl.save()
-                    print(f"🎨 Color de etiqueta actualizado: {name} -> {color}")
+                    # print(f"🎨 Color de etiqueta actualizado: {name} -> {color}")
+                final_names.append(lbl.name)
             except:
                 # Create if not exists
                 try:
-                    self.project.labels.create({'name': name, 'color': color})
-                    print(f"🏷️ Etiqueta creada: {name} ({color})")
+                    self.project.labels.create({'name': name, 'color': color or "#FF0000"})
+                    print(f"🏷️ Etiqueta creada: {name} ({color or '#FF0000'})")
+                    final_names.append(name)
                 except Exception as e:
                     print(f"⚠️ Error al crear etiqueta {name}: {e}")
-        return names
+        return final_names
 
-    def upload_from_json(self, json_path, global_labels=None, label_color="#FF0000", milestone_id=None, start_date=None, due_date=None, assignee_id=None):
+    def upload_from_json(self, json_path, global_labels=None, label_color=None, milestone_id=None, start_date=None, due_date=None, assignee_id=None):
         """Reads JSON file and creates issues in GitLab with optional global metadata."""
         if not os.path.exists(json_path):
             print(f"Error: El archivo {json_path} no existe.")
@@ -74,14 +113,18 @@ class GitLabUploader:
             if due_date: description += f"\n\n/due_date {due_date}"
             
             labels = issue_data.get("labels", [])
-            labels.extend(extra_label_names)
+            # Also ensure these per-issue labels exist (e.g. "Story", "Bug" from PDF)
+            valid_issue_labels = self.ensure_labels(labels)
+            
+            # Combine with global extra labels
+            valid_issue_labels.extend(extra_label_names)
             
             try:
                 # Create issue
                 payload = {
                     'title': title,
                     'description': description,
-                    'labels': list(set(labels)), # Unique labels
+                    'labels': list(set(valid_issue_labels)), # Unique labels
                     'weight': issue_data.get("attributes", {}).get("weight"),
                     'milestone_id': milestone_id or issue_data.get("attributes", {}).get("milestone_id"),
                     'start_date': start_date,

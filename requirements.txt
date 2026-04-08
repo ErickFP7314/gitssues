@@ -1,3 +1,5 @@
 pdfplumber
 python-gitlab
 python-dotenv
+questionary
+colorama

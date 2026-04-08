@@ -1,7 +1,27 @@
 import argparse
 import sys
+import os
 from parser import IssueParser
 from uploader import GitLabUploader
+import questionary
+from colorama import init, Fore, Style
+
+# Initialize colorama
+init(autoreset=True)
+
+def print_banner(text):
+    print(f"\n{Style.BRIGHT}{Fore.CYAN}{'='*len(text)}")
+    print(f"{Style.BRIGHT}{Fore.CYAN}{text}")
+    print(f"{Style.BRIGHT}{Fore.CYAN}{'='*len(text)}\n")
+
+def print_success(text):
+    print(f"{Fore.GREEN}✅ {text}")
+
+def print_error(text):
+    print(f"{Fore.RED}❌ {text}")
+
+def print_warning(text):
+    print(f"{Fore.YELLOW}⚠️ {text}")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -23,83 +43,192 @@ def main():
 
     if args.command == "parse":
         try:
-            print(f"--- FASE DE EXTRACCIÓN ---")
-            print(f"Procesando: {args.pdf_path}")
+            print_banner("FASE DE EXTRACCIÓN")
+            print(f"Procesando: {Fore.BLUE}{args.pdf_path}")
+            
             parser_obj = IssueParser()
             issues = parser_obj.from_pdf(args.pdf_path)
+            
+            # --- Visual Report of Detected Labels ---
+            print(f"\n{Style.BRIGHT}Resumen de Extracción:")
+            print(f"{Fore.CYAN}{'-'*60}")
+            print(f"{Style.BRIGHT}{'#':<3} | {'Título del Issue':<40} | {'Etiquetas'}")
+            print(f"{Fore.CYAN}{'-'*60}")
+            
+            for i, entry in enumerate(issues, 1):
+                title = entry['issue_data']['title']
+                # Truncate title if too long
+                display_title = (title[:37] + '...') if len(title) > 40 else title
+                labels = ", ".join(entry['issue_data']['labels']) if entry['issue_data']['labels'] else "Ninguna"
+                print(f"{i:<3} | {display_title:<40} | {Fore.YELLOW}{labels}")
+            print(f"{Fore.CYAN}{'-'*60}\n")
+            
             parser_obj.save_to_json(issues, args.output)
-            print(f"✅ Extracción completada. {len(issues)} issues guardadas en '{args.output}'.")
+            print_success(f"Extracción completada. {len(issues)} issues guardadas en '{args.output}'.")
             print(f"Por favor, revise el archivo JSON antes de subirlo.")
         except Exception as e:
-            print(f"❌ Error durante el parsing: {e}")
+            print_error(f"Error durante el parsing: {e}")
             sys.exit(1)
 
     elif args.command == "upload":
         try:
-            print(f"--- FASE DE CARGA A GITLAB ---")
+            print_banner("FASE DE CARGA A GITLAB")
             uploader = GitLabUploader(env_path=args.env)
             
+            # --- Navegación de Proyectos/Grupos ---
+            initial_id = uploader.project_id
+            target_project = uploader.get_project(initial_id)
+            
+            if not target_project:
+                group = uploader.get_group(initial_id)
+                if group:
+                    print_warning(f"ID '{initial_id}' detectado como Grupo. Iniciando navegación...")
+                    history = []
+                    current_group = group
+                    
+                    while True:
+                        subgroups, projects = uploader.get_group_contents(current_group)
+                        choices = []
+                        if history:
+                            choices.append(questionary.Choice("⬅️  .. (Volver atrás)", value="BACK"))
+                        
+                        for sg in subgroups:
+                            choices.append(questionary.Choice(f"📁 [Grupo] {sg.name}", value=("GROUP", sg.id)))
+                        
+                        for p in projects:
+                            choices.append(questionary.Choice(f"🚀 [Proyecto] {p.name}", value=("PROJECT", p.id)))
+                        
+                        if not choices:
+                            print_error("Este grupo está vacío (sin proyectos ni subgrupos).")
+                            sys.exit(1)
+                            
+                        selection = questionary.select(
+                            f"📁 Grupo: {current_group.full_name}. Seleccione:",
+                            choices=choices
+                        ).ask()
+                        
+                        if selection is None:
+                            print_error("Operación cancelada.")
+                            sys.exit(0)
+                        
+                        if selection == "BACK":
+                            current_group = history.pop()
+                        elif selection[0] == "GROUP":
+                            history.append(current_group)
+                            current_group = uploader.gl.groups.get(selection[1])
+                        elif selection[0] == "PROJECT":
+                            target_project = uploader.gl.projects.get(selection[1])
+                            break
+                else:
+                    print_error(f"No se encontró Proyecto ni Grupo con ID: {initial_id}")
+                    sys.exit(1)
+
+            uploader.set_project(target_project)
+            print_success(f"Conectado al proyecto: {Style.BRIGHT}{target_project.name_with_namespace}")
+
             # --- Interacción para Metadata Global ---
-            print("\nConfiguración opcional para todas las issues:")
+            print(f"{Style.BRIGHT}Configuración opcional para todas las issues:\n")
             
             # 1. Etiquetas globales
-            g_labels = input("Etiquetas adicionales (separadas por coma, ej: Sprint-2, Frontend) [Enter para omitir]: ").strip()
-            g_color = "#FF0000"
-            if g_labels:
-                g_color = input("Color para estas etiquetas (HEX, ej: #FF0000) [#FF0000]: ").strip() or "#FF0000"
+            all_labels_to_apply = []
             
+            # Step 1.1: Existing labels selection
+            existing_labels = []
+            try:
+                existing_labels = uploader.get_labels()
+                if existing_labels:
+                    label_names = [lb.name for lb in existing_labels]
+                    choices = questionary.checkbox(
+                        "Seleccione etiquetas existentes para aplicar a todas las issues:",
+                        choices=label_names
+                    ).ask()
+                    if choices:
+                        all_labels_to_apply.extend(choices)
+            except Exception as e:
+                print_warning(f"No se pudieron obtener las etiquetas existentes: {e}")
+
+            # Step 1.2: New labels interactive creation
+            existing_names_set = {lb.name.lower() for lb in existing_labels} if existing_labels else set()
+            
+            print(f"\n{Fore.CYAN}Creación de nuevas etiquetas (opcional):")
+            while True:
+                new_lb_name = questionary.text("Nombre de nueva etiqueta (vacío para terminar):").ask()
+                if not new_lb_name:
+                    break
+                
+                new_lb_name = new_lb_name.strip()
+                if new_lb_name.lower() in existing_names_set:
+                    print_error(f"La etiqueta '{new_lb_name}' ya existe en el proyecto.")
+                    continue
+                
+                new_lb_color = questionary.text(
+                    f"Color para '{new_lb_name}' (HEX, ej: #FF0000):",
+                    default="#FF0000"
+                ).ask() or "#FF0000"
+                
+                if not new_lb_color.startswith("#"):
+                    new_lb_color = "#" + new_lb_color
+
+                try:
+                    uploader.ensure_labels([new_lb_name], color=new_lb_color)
+                    all_labels_to_apply.append(new_lb_name)
+                    existing_names_set.add(new_lb_name.lower())
+                    print_success(f"Etiqueta '{new_lb_name}' registrada.")
+                except Exception as e:
+                    print_error(f"Error al crear la etiqueta: {e}")
+
             # 2. Milestones
             selected_milestone_id = None
             try:
                 milestones = uploader.get_milestones()
                 if milestones:
-                    print("\nMilestones activos encontrados:")
-                    print("0) Ninguno")
-                    for i, m in enumerate(milestones, 1):
-                        print(f"{i}) {m.title} (ID: {m.id})")
+                    m_choices = ["Ninguno"] + [f"{m.title} (ID: {m.id})" for m in milestones]
+                    m_selection = questionary.select(
+                        "Seleccione un milestone:",
+                        choices=m_choices
+                    ).ask()
                     
-                    choice = input(f"\nSeleccione un milestone (0-{len(milestones)}) [0]: ").strip()
-                    if choice and choice.isdigit() and 1 <= int(choice) <= len(milestones):
-                        selected_milestone_id = milestones[int(choice)-1].id
-                        print(f"Asignando milestone: {milestones[int(choice)-1].title}")
+                    if m_selection != "Ninguno":
+                        idx = m_choices.index(m_selection) - 1
+                        selected_milestone_id = milestones[idx].id
+                        print_success(f"Milestone asignado: {milestones[idx].title}")
             except Exception as e:
-                print(f"⚠️ No se pudieron obtener los milestones: {e}")
+                print_warning(f"No se pudieron obtener los milestones: {e}")
 
             # 3. Members / Assignee
             selected_assignee_id = None
             try:
                 members = uploader.get_members()
                 if members:
-                    print("\nMiembros del proyecto encontrados:")
-                    print("0) Ninguno")
-                    for i, m in enumerate(members, 1):
-                        display_name = m.name if hasattr(m, 'name') else m.username
-                        print(f"{i}) {display_name} (@{m.username})")
+                    member_choices = ["Ninguno"] + [f"{m.name if hasattr(m, 'name') else m.username} (@{m.username})" for m in members]
+                    member_selection = questionary.select(
+                        "¿Deseas asignar estas historias a alguien?",
+                        choices=member_choices
+                    ).ask()
                     
-                    m_choice = input(f"\n¿Deseas asignar estas historias a alguien? (0-{len(members)}) [0]: ").strip()
-                    if m_choice and m_choice.isdigit() and 1 <= int(m_choice) <= len(members):
-                        selected_assignee_id = members[int(m_choice)-1].id
-                        print(f"Asignando a: {members[int(m_choice)-1].name}")
+                    if member_selection != "Ninguno":
+                        idx = member_choices.index(member_selection) - 1
+                        selected_assignee_id = members[idx].id
+                        print_success(f"Asignado a: {members[idx].name if hasattr(members[idx], 'name') else members[idx].username}")
             except Exception as e:
-                print(f"⚠️ No se pudieron obtener los miembros: {e}")
+                print_warning(f"No se pudieron obtener los miembros: {e}")
 
             # 4. Fechas
-            print("\nConfiguración de fechas (formato YYYY-MM-DD):")
-            s_date = input("Fecha de inicio [Enter para omitir]: ").strip()
-            d_date = input("Fecha límite (Due Date) [Enter para omitir]: ").strip()
+            print(f"\n{Fore.CYAN}Configuración de fechas (YYYY-MM-DD):")
+            s_date = questionary.text("Fecha de inicio (opcional):").ask()
+            d_date = questionary.text("Fecha límite (opcional):").ask()
 
-            print("\n--- Iniciando carga ---")
+            print_banner("INICIANDO CARGA")
             uploader.upload_from_json(
                 args.json_path, 
-                global_labels=g_labels, 
-                label_color=g_color,
+                global_labels=all_labels_to_apply, 
                 milestone_id=selected_milestone_id,
                 start_date=s_date if s_date else None,
                 due_date=d_date if d_date else None,
                 assignee_id=selected_assignee_id
             )
         except Exception as e:
-            print(f"❌ Error durante la carga: {e}")
+            print_error(f"Error durante la carga: {e}")
             sys.exit(1)
 
     else:
