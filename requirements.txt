@@ -1,0 +1,3 @@
+pdfplumber
+python-gitlab
+python-dotenv

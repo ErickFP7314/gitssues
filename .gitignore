@@ -1,0 +1,14 @@
+# Environments
+venv/
+.env
+config.env
+__pycache__/
+*.pyc
+
+# Data
+*.json
+*.pdf
+
+# Tools
+.agents/
+skills-lock.json
